@@ -1,0 +1,720 @@
+from pathlib import Path
+import csv
+import os
+
+import numpy as np
+import rasterio
+from pyproj import CRS
+
+
+# ============================================================
+# 1. 文件路径
+# ============================================================
+
+base_dir = Path(
+    r"C:\Users\linyu\Desktop\科研\GLC_FCS30D数据\E110-E115"
+    r"\2010年处理结果\统一分类结果"
+)
+
+# GLC 已经聚合到 MCD 网格的结果
+glc_path = (
+    base_dir
+    / "统一分辨率结果"
+    / "GLC_2010_common9_on_MCD_grid.tif"
+)
+
+# MCD 原有的重分类结果
+mcd_path = base_dir / "MCD12C1_2010_common9 统一重分类.tif"
+
+# 上一步生成的共同有效区域；如果不存在，程序会自动取两者交集
+common_mask_path = (
+    base_dir
+    / "统一分辨率结果"
+    / "共同有效区域.tif"
+)
+
+# 输出目录
+output_dir = base_dir / "一致性与差异分析"
+
+agreement_path = output_dir / "GLC与MCD一致性图.tif"
+combination_path = output_dir / "GLC与MCD类别组合图.tif"
+
+count_matrix_path = output_dir / "类别对应矩阵_像元数.csv"
+area_matrix_path = output_dir / "类别对应矩阵_面积平方千米.csv"
+class_metrics_path = output_dir / "各类别一致性指标.csv"
+summary_path = output_dir / "总体一致性指标.csv"
+
+
+# ============================================================
+# 2. 分类名称
+# ============================================================
+
+class_names = {
+    1: "水体",
+    2: "森林",
+    3: "灌木地与稀树草原",
+    4: "草地",
+    5: "耕地",
+    6: "湿地",
+    7: "建设用地",
+    8: "裸地与稀疏植被",
+    9: "冰雪",
+}
+
+
+# ============================================================
+# 3. 辅助函数
+# ============================================================
+
+def check_same_grid(glc, mcd):
+    """检查两个栅格能否直接逐像元比较。"""
+
+    same = (
+        glc.crs == mcd.crs
+        and glc.width == mcd.width
+        and glc.height == mcd.height
+        and glc.transform.almost_equals(mcd.transform)
+    )
+
+    if not same:
+        raise ValueError(
+            "GLC 与 MCD 网格不一致，不能直接比较。\n"
+            f"GLC：{glc.width} × {glc.height}，{glc.crs}，"
+            f"{glc.transform}\n"
+            f"MCD：{mcd.width} × {mcd.height}，{mcd.crs}，"
+            f"{mcd.transform}"
+        )
+
+
+def calculate_row_areas_km2(src):
+    """
+    计算每一行中单个像元的面积，单位为 km²。
+
+    经纬度坐标系使用椭球面积；
+    投影坐标系使用仿射变换和坐标单位计算。
+    """
+
+    crs = CRS.from_user_input(src.crs)
+    transform = src.transform
+
+    if crs.is_geographic:
+        if abs(transform.b) > 1e-12 or abs(transform.d) > 1e-12:
+            raise ValueError(
+                "当前经纬度栅格发生了旋转，"
+                "本脚本无法按行计算面积。"
+            )
+
+        geod = crs.get_geod()
+        row_areas = np.zeros(src.height, dtype=np.float64)
+
+        # 任取一个像元的左右边界。
+        # 在规则经纬网格中，同一纬度行的像元面积相同。
+        lon_left = transform.c
+        lon_right = transform.c + transform.a
+
+        for row in range(src.height):
+            lat_top = transform.f + row * transform.e
+            lat_bottom = transform.f + (row + 1) * transform.e
+
+            area_m2, _ = geod.polygon_area_perimeter(
+                [
+                    lon_left,
+                    lon_right,
+                    lon_right,
+                    lon_left,
+                ],
+                [
+                    lat_top,
+                    lat_top,
+                    lat_bottom,
+                    lat_bottom,
+                ],
+            )
+
+            row_areas[row] = abs(area_m2) / 1_000_000
+
+        return row_areas
+
+    # 投影坐标系：计算一个像元的平面面积。
+    determinant = abs(
+        transform.a * transform.e
+        - transform.b * transform.d
+    )
+
+    axis_info = crs.axis_info
+
+    if len(axis_info) >= 2:
+        x_to_metre = axis_info[0].unit_conversion_factor
+        y_to_metre = axis_info[1].unit_conversion_factor
+    else:
+        x_to_metre = 1.0
+        y_to_metre = 1.0
+
+    pixel_area_km2 = (
+        determinant
+        * x_to_metre
+        * y_to_metre
+        / 1_000_000
+    )
+
+    return np.full(
+        src.height,
+        pixel_area_km2,
+        dtype=np.float64,
+    )
+
+
+def safe_divide(numerator, denominator):
+    if denominator == 0:
+        return np.nan
+
+    return numerator / denominator
+
+
+def calculate_kappa(matrix):
+    """
+    由对应矩阵计算总体一致率和 Cohen's Kappa。
+    矩阵行是 MCD，列是 GLC。
+    """
+
+    total = matrix.sum()
+
+    if total == 0:
+        return np.nan, np.nan
+
+    observed = np.trace(matrix) / total
+
+    row_totals = matrix.sum(axis=1)
+    column_totals = matrix.sum(axis=0)
+
+    expected = (
+        np.sum(row_totals * column_totals)
+        / (total * total)
+    )
+
+    if np.isclose(1 - expected, 0):
+        kappa = np.nan
+    else:
+        kappa = (observed - expected) / (1 - expected)
+
+    return observed, kappa
+
+
+def write_matrix_csv(path, matrix, number_format):
+    """
+    输出 9×9 类别对应矩阵。
+    行表示 MCD，列表示 GLC。
+    """
+
+    with open(
+        path,
+        "w",
+        newline="",
+        encoding="utf-8-sig",
+    ) as file:
+        writer = csv.writer(file)
+
+        writer.writerow(
+            ["MCD类别 \\ GLC类别"]
+            + [
+                f"{code} {class_names[code]}"
+                for code in range(1, 10)
+            ]
+            + ["MCD合计"]
+        )
+
+        for row_index in range(9):
+            row_values = matrix[row_index, :]
+
+            writer.writerow(
+                [
+                    f"{row_index + 1} "
+                    f"{class_names[row_index + 1]}"
+                ]
+                + [
+                    number_format(value)
+                    for value in row_values
+                ]
+                + [
+                    number_format(row_values.sum())
+                ]
+            )
+
+        column_totals = matrix.sum(axis=0)
+
+        writer.writerow(
+            ["GLC合计"]
+            + [
+                number_format(value)
+                for value in column_totals
+            ]
+            + [
+                number_format(matrix.sum())
+            ]
+        )
+
+
+# ============================================================
+# 4. 主程序
+# ============================================================
+
+def main():
+    for path in (glc_path, mcd_path):
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"找不到输入文件：\n{path}"
+            )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    agreement_temp = agreement_path.with_name(
+        agreement_path.stem + ".partial.tif"
+    )
+
+    combination_temp = combination_path.with_name(
+        combination_path.stem + ".partial.tif"
+    )
+
+    # 行 = MCD 类别，列 = GLC 类别
+    count_matrix = np.zeros(
+        (9, 9),
+        dtype=np.int64,
+    )
+
+    area_matrix = np.zeros(
+        (9, 9),
+        dtype=np.float64,
+    )
+
+    use_common_mask = common_mask_path.is_file()
+
+    if use_common_mask:
+        print("使用共同有效区域：")
+        print(common_mask_path)
+    else:
+        print(
+            "没有找到共同有效区域文件，"
+            "将自动使用 GLC 与 MCD 有效像元的交集。"
+        )
+
+    with rasterio.Env(
+        GDAL_CACHEMAX=64 * 1024 * 1024
+    ):
+        with rasterio.open(glc_path) as glc, \
+                rasterio.open(mcd_path) as mcd:
+
+            check_same_grid(glc, mcd)
+
+            print("\n网格检查通过：")
+            print("行列数:", mcd.height, mcd.width)
+            print("坐标系:", mcd.crs)
+            print("分辨率:", mcd.res)
+            print("范围:", mcd.bounds)
+
+            # 每一行的单像元实际面积。
+            row_areas_km2 = calculate_row_areas_km2(mcd)
+
+            agreement_profile = mcd.profile.copy()
+            agreement_profile.update(
+                driver="GTiff",
+                count=1,
+                dtype="uint8",
+                nodata=0,
+                compress="lzw",
+                tiled=True,
+                blockxsize=256,
+                blockysize=256,
+                BIGTIFF="IF_SAFER",
+            )
+
+            combination_profile = agreement_profile.copy()
+            combination_profile.update(
+                dtype="uint16"
+            )
+
+            mask_src = None
+
+            try:
+                if use_common_mask:
+                    mask_src = rasterio.open(common_mask_path)
+                    check_same_grid(mask_src, mcd)
+
+                with rasterio.open(
+                    agreement_temp,
+                    "w",
+                    **agreement_profile,
+                ) as agreement_dst, \
+                        rasterio.open(
+                            combination_temp,
+                            "w",
+                            **combination_profile,
+                        ) as combination_dst:
+
+                    processed_blocks = 0
+                    total_blocks = (
+                        (mcd.height + 255) // 256
+                        * (mcd.width + 255) // 256
+                    )
+
+                    for _, window in mcd.block_windows(1):
+                        glc_data = glc.read(
+                            1,
+                            window=window,
+                        )
+
+                        mcd_data = mcd.read(
+                            1,
+                            window=window,
+                        )
+
+                        # 重分类后的有效类别应为 1—9。
+                        valid = (
+                            (glc_data >= 1)
+                            & (glc_data <= 9)
+                            & (mcd_data >= 1)
+                            & (mcd_data <= 9)
+                        )
+
+                        if mask_src is not None:
+                            common_mask = mask_src.read(
+                                1,
+                                window=window,
+                            )
+
+                            valid &= common_mask == 1
+
+                        agreement = np.zeros(
+                            glc_data.shape,
+                            dtype=np.uint8,
+                        )
+
+                        # 1 = 一致；2 = 不一致；0 = 无数据
+                        agreement[valid] = np.where(
+                            glc_data[valid]
+                            == mcd_data[valid],
+                            1,
+                            2,
+                        )
+
+                        combination = np.zeros(
+                            glc_data.shape,
+                            dtype=np.uint16,
+                        )
+
+                        # 组合码 = MCD代码 × 10 + GLC代码
+                        # 例如 25 表示：
+                        # MCD=森林(2)，GLC=耕地(5)
+                        combination[valid] = (
+                            mcd_data[valid].astype(
+                                np.uint16
+                            )
+                            * 10
+                            + glc_data[valid].astype(
+                                np.uint16
+                            )
+                        )
+
+                        agreement_dst.write(
+                            agreement,
+                            1,
+                            window=window,
+                        )
+
+                        combination_dst.write(
+                            combination,
+                            1,
+                            window=window,
+                        )
+
+                        if np.any(valid):
+                            # 转为 0—80 的一维矩阵索引。
+                            indexes = (
+                                (mcd_data[valid] - 1) * 9
+                                + (glc_data[valid] - 1)
+                            ).astype(np.int16)
+
+                            block_counts = np.bincount(
+                                indexes,
+                                minlength=81,
+                            ).reshape(9, 9)
+
+                            count_matrix += block_counts
+
+                            row_start = int(window.row_off)
+                            row_end = (
+                                row_start
+                                + int(window.height)
+                            )
+
+                            # 当前块中每个像元的面积。
+                            block_row_areas = (
+                                row_areas_km2[
+                                    row_start:row_end
+                                ][:, np.newaxis]
+                            )
+
+                            pixel_areas = np.broadcast_to(
+                                block_row_areas,
+                                glc_data.shape,
+                            )[valid]
+
+                            block_areas = np.bincount(
+                                indexes,
+                                weights=pixel_areas,
+                                minlength=81,
+                            ).reshape(9, 9)
+
+                            area_matrix += block_areas
+
+                        processed_blocks += 1
+
+                        if (
+                            processed_blocks % 100 == 0
+                            or processed_blocks
+                            == total_blocks
+                        ):
+                            print(
+                                f"\r已处理 "
+                                f"{processed_blocks}/"
+                                f"{total_blocks} 个块",
+                                end="",
+                                flush=True,
+                            )
+
+                    agreement_dst.set_band_description(
+                        1,
+                        "1=agreement, 2=disagreement",
+                    )
+
+                    agreement_dst.update_tags(
+                        value_1="一致",
+                        value_2="不一致",
+                        value_0="无数据或未纳入比较",
+                    )
+
+                    combination_dst.set_band_description(
+                        1,
+                        "MCD class x 10 + GLC class",
+                    )
+
+                    combination_dst.update_tags(
+                        coding=(
+                            "两位数中十位是MCD类别，"
+                            "个位是GLC类别"
+                        ),
+                        example=(
+                            "25=MCD森林(2),GLC耕地(5)"
+                        ),
+                    )
+
+            finally:
+                if mask_src is not None:
+                    mask_src.close()
+
+    print("\n栅格比较完成。")
+
+    if count_matrix.sum() == 0:
+        raise ValueError(
+            "共同有效区域中没有可比较的像元。"
+        )
+
+    # 成功完成后再替换正式文件。
+    os.replace(agreement_temp, agreement_path)
+    os.replace(combination_temp, combination_path)
+
+    # ========================================================
+    # 5. 计算总体指标
+    # ========================================================
+
+    count_oa, count_kappa = calculate_kappa(
+        count_matrix.astype(np.float64)
+    )
+
+    area_oa, area_kappa = calculate_kappa(
+        area_matrix
+    )
+
+    total_count = int(count_matrix.sum())
+    same_count = int(np.trace(count_matrix))
+    different_count = total_count - same_count
+
+    total_area = float(area_matrix.sum())
+    same_area = float(np.trace(area_matrix))
+    different_area = total_area - same_area
+
+    # ========================================================
+    # 6. 输出对应矩阵
+    # ========================================================
+
+    write_matrix_csv(
+        count_matrix_path,
+        count_matrix,
+        lambda value: str(int(value)),
+    )
+
+    write_matrix_csv(
+        area_matrix_path,
+        area_matrix,
+        lambda value: f"{float(value):.6f}",
+    )
+
+    # ========================================================
+    # 7. 输出逐类别指标
+    # ========================================================
+
+    with open(
+        class_metrics_path,
+        "w",
+        newline="",
+        encoding="utf-8-sig",
+    ) as file:
+        writer = csv.writer(file)
+
+        writer.writerow([
+            "类别代码",
+            "类别名称",
+            "一致面积_km2",
+            "MCD面积_km2",
+            "GLC面积_km2",
+            "GLC减MCD面积_km2",
+            "MCD类别中与GLC一致的比例",
+            "GLC类别中与MCD一致的比例",
+            "F1",
+            "IoU",
+        ])
+
+        for index in range(9):
+            class_code = index + 1
+
+            agreement_area = area_matrix[index, index]
+            mcd_area = area_matrix[index, :].sum()
+            glc_area = area_matrix[:, index].sum()
+
+            mcd_agreement = safe_divide(
+                agreement_area,
+                mcd_area,
+            )
+
+            glc_agreement = safe_divide(
+                agreement_area,
+                glc_area,
+            )
+
+            f1 = safe_divide(
+                2 * agreement_area,
+                mcd_area + glc_area,
+            )
+
+            iou = safe_divide(
+                agreement_area,
+                mcd_area
+                + glc_area
+                - agreement_area,
+            )
+
+            writer.writerow([
+                class_code,
+                class_names[class_code],
+                f"{agreement_area:.6f}",
+                f"{mcd_area:.6f}",
+                f"{glc_area:.6f}",
+                f"{glc_area - mcd_area:.6f}",
+                (
+                    ""
+                    if np.isnan(mcd_agreement)
+                    else f"{mcd_agreement:.6f}"
+                ),
+                (
+                    ""
+                    if np.isnan(glc_agreement)
+                    else f"{glc_agreement:.6f}"
+                ),
+                "" if np.isnan(f1) else f"{f1:.6f}",
+                "" if np.isnan(iou) else f"{iou:.6f}",
+            ])
+
+    # ========================================================
+    # 8. 输出总体指标
+    # ========================================================
+
+    with open(
+        summary_path,
+        "w",
+        newline="",
+        encoding="utf-8-sig",
+    ) as file:
+        writer = csv.writer(file)
+
+        writer.writerow(["指标", "结果"])
+
+        writer.writerow([
+            "共同有效粗网格像元数",
+            total_count,
+        ])
+
+        writer.writerow([
+            "一致像元数",
+            same_count,
+        ])
+
+        writer.writerow([
+            "不一致像元数",
+            different_count,
+        ])
+
+        writer.writerow([
+            "按像元数量总体一致率",
+            f"{count_oa:.6f}",
+        ])
+
+        writer.writerow([
+            "按像元数量Kappa",
+            f"{count_kappa:.6f}",
+        ])
+
+        writer.writerow([
+            "共同有效面积_km2",
+            f"{total_area:.6f}",
+        ])
+
+        writer.writerow([
+            "一致面积_km2",
+            f"{same_area:.6f}",
+        ])
+
+        writer.writerow([
+            "不一致面积_km2",
+            f"{different_area:.6f}",
+        ])
+
+        writer.writerow([
+            "按面积总体一致率",
+            f"{area_oa:.6f}",
+        ])
+
+        writer.writerow([
+            "按面积Kappa",
+            f"{area_kappa:.6f}",
+        ])
+
+    print("\n分析完成，结果保存在：")
+    print(output_dir)
+
+    print("\n主要结果：")
+    print(f"共同有效像元数：{total_count:,}")
+    print(f"一致像元数：{same_count:,}")
+    print(f"不一致像元数：{different_count:,}")
+    print(f"按面积总体一致率：{area_oa:.2%}")
+    print(f"按面积 Kappa：{area_kappa:.4f}")
+
+    print("\n生成文件：")
+    print(agreement_path)
+    print(combination_path)
+    print(count_matrix_path)
+    print(area_matrix_path)
+    print(class_metrics_path)
+    print(summary_path)
+
+
+if __name__ == "__main__":
+    main()
