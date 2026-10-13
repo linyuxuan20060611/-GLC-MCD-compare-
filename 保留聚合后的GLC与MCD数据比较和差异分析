@@ -1,0 +1,234 @@
+"""比较已有 GLC 九类比例和 MCD 重分类结果；不执行聚合或重分类。
+
+依赖：python -m pip install numpy rasterio pyproj
+GLC 默认：波段1--9对应类别1--9，值为百分数（0--100）。
+"""
+from pathlib import Path
+from datetime import datetime
+import csv
+import numpy as np
+
+BASE_DIR = Path(r"C:\Users\linyu\Desktop\科研\GLC_FCS30D数据\E110-E115\2010年处理结果\统一分类结果")
+GLC_PATH = BASE_DIR / "统一分辨率结果（保留聚合法）" / "GLC_2010_common9_on_MCD_grid.tif"
+MCD_PATH = BASE_DIR / "MCD12C1_2010_common9 统一重分类.tif"
+OUTPUT_ROOT = GLC_PATH.parent / "比例差异分析"
+
+# 与此前九类比例聚合代码的波段顺序一致。
+CLASS_BANDS = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+NAMES = ["水体", "森林", "灌木地与稀树草原", "草地", "耕地",
+         "湿地", "建设用地", "裸地与稀疏植被", "冰雪"]
+# 百分数数据用100；只有确定输入是0--1小数时才改为1。
+INPUT_TOTAL = 100.0
+# 可选：有效GLC面积/完整MCD像元面积（0--100）的覆盖率文件。
+# 此前的“共同有效区域.tif”只有0/1标记，不能作为面积覆盖率。
+COVERAGE_PATH = GLC_PATH.parent / "GLC有效面积覆盖率_on_MCD_grid.tif"
+MIN_COVERAGE = 0.999
+NODATA = -9999.0
+
+
+def windows(width, height, size=256):
+    from rasterio.windows import Window
+    for row in range(0, height, size):
+        for col in range(0, width, size):
+            yield Window(col, row, min(size, width-col), min(size, height-row))
+
+
+def same_grid(first, second):
+    if (first.crs != second.crs or first.width != second.width
+            or first.height != second.height
+            or not np.allclose(tuple(first.transform), tuple(second.transform),
+                               rtol=0, atol=1e-10)):
+        raise ValueError("GLC、MCD或覆盖率文件的坐标系、行列数、像元位置不一致。")
+
+
+def row_areas(src):
+    """经纬线矩形在其椭球上的面积（km²），要求规则经纬网格。"""
+    from pyproj import CRS
+    crs = CRS.from_user_input(src.crs)
+    t = src.transform
+    if not crs.is_geographic or abs(t.b) > 1e-12 or abs(t.d) > 1e-12:
+        raise ValueError("本分析使用MCD规则经纬度网格；当前坐标系或旋转不符合要求。")
+    if any(abs(a.unit_conversion_factor - np.pi/180) > 1e-12
+           for a in crs.axis_info[:2]):
+        raise ValueError("经纬度坐标单位必须为度。")
+    edges = t.f + np.arange(src.height+1) * t.e
+    if np.any(np.abs(edges) > 90.000001):
+        raise ValueError("栅格纬度范围超出[-90,90]。")
+    geod = crs.get_geod()
+    u = np.sin(np.deg2rad(np.clip(edges, -90, 90)))
+    e2 = geod.f * (2-geod.f)
+    if e2 < 0:
+        raise ValueError("不支持长球体坐标系统。")
+    if e2 == 0:
+        integral = geod.a**2 * u
+    else:
+        e = np.sqrt(e2)
+        integral = geod.a**2 * (1-e2) / 2 * (
+            u / (1-e2*u*u) + np.arctanh(e*u)/e)
+    area = np.abs(np.diff(integral)) * np.deg2rad(abs(t.a)) / 1e6
+    if np.any(area <= 0):
+        raise ValueError("像元面积必须大于0。")
+    return area
+
+
+def proportions(data, masks):
+    """返回九类份额、二维有效掩膜和归一化前的最大和误差。"""
+    p = data.astype(np.float64) / INPUT_TOTAL
+    valid = np.all(masks > 0, axis=0) & np.all(np.isfinite(p), axis=0)
+    if np.any(valid & np.any((p < -1e-6) | (p > 1+1e-6), axis=0)):
+        raise ValueError("有效GLC比例超出允许范围，请核对百分数单位和NoData设置。")
+    totals = p.sum(axis=0)
+    error = np.abs(totals[valid]-1)
+    maximum = float(error.max()) if error.size else 0.0
+    if maximum > 1e-4:
+        raise ValueError(
+            f"九类比例和不是100%，最大误差为{maximum*100:.6f}个百分点。"
+            "请检查波段顺序、单位和缺测值；程序不会强行归一化错误数据。")
+    p[:, ~valid] = 0
+    p = np.clip(p, 0, 1)
+    # 仅修正校验通过后的微小浮点舍入误差。
+    if np.any(valid):
+        p[:, valid] /= p[:, valid].sum(axis=0)
+    return p, valid, maximum
+
+
+def csv_write(path, header, rows):
+    def formatted(x):
+        if isinstance(x, (float, np.floating)):
+            return "" if not np.isfinite(x) else f"{x:.8f}"
+        return x
+    with path.open("w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.writer(file)
+        writer.writerow(header)
+        writer.writerows([[formatted(x) for x in row] for row in rows])
+
+
+def main():
+    import rasterio
+    from contextlib import ExitStack
+    for path in (GLC_PATH, MCD_PATH):
+        if not path.is_file():
+            raise FileNotFoundError(f"找不到输入文件：{path}")
+    if INPUT_TOTAL not in (1.0, 100.0):
+        raise ValueError("INPUT_TOTAL只能是1或100。")
+    with ExitStack() as stack:
+        stack.enter_context(rasterio.Env(GDAL_CACHEMAX=64*1024*1024))
+        glc = stack.enter_context(rasterio.open(GLC_PATH))
+        mcd = stack.enter_context(rasterio.open(MCD_PATH))
+        print(f"GLC：{GLC_PATH}\n波段数：{glc.count}；类型：{glc.dtypes}\n说明：{glc.descriptions}")
+        print(f"MCD：{MCD_PATH}", flush=True)
+        if glc.count < max(CLASS_BANDS):
+            raise ValueError(
+                f"当前文件实际只有{glc.count}个波段，无法读取9类比例。\n"
+                "这不涉及重分类是否正确，也不根据文件名判断聚合方法。\n"
+                "请把GLC_PATH指向保存九类比例的实际文件；若九类分别在不同文件，"
+                "应先按类别顺序组合读取。程序不会把一个类别编码扩充成九类比例。")
+        if mcd.count != 1 or mcd.crs is None:
+            raise ValueError("MCD输入应是具有坐标系的单波段重分类文件。")
+        same_grid(glc, mcd)
+        area_by_row = row_areas(mcd)
+        cover = None
+        if COVERAGE_PATH is not None:
+            cover = stack.enter_context(rasterio.open(COVERAGE_PATH))
+            same_grid(cover, mcd)
+            if cover.count != 1:
+                raise ValueError("有效面积覆盖率文件必须是单波段。")
+        else:
+            print("未提供有效面积覆盖率：面积统计采用整格面积，标记为等效面积；"
+                  "不能据此确定边缘缺测部分的真实面积。", flush=True)
+
+        # 先检查所有输入，避免发现坏数据后仍留下看似完整的结果。
+        max_error = 0.0
+        for window in windows(mcd.width, mcd.height):
+            _, _, err = proportions(glc.read(CLASS_BANDS, window=window),
+                                     glc.read_masks(CLASS_BANDS, window=window))
+            max_error = max(max_error, err)
+            labels = mcd.read(1, window=window)
+            labelled = mcd.read_masks(1, window=window) > 0
+            if np.any(labelled & ~np.isin(labels, np.arange(10))):
+                raise ValueError("MCD中存在0--9以外的有效值，请检查重分类输入。")
+            if cover is not None:
+                cv = cover.read(1, window=window)
+                cm = cover.read_masks(1, window=window) > 0
+                if np.any(cm & (~np.isfinite(cv) | (cv < 0) | (cv > 100.0001))):
+                    raise ValueError("有效面积覆盖率必须在0--100范围内。")
+
+        output = OUTPUT_ROOT / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        output.mkdir(parents=True, exist_ok=False)
+        profile = dict(driver="GTiff", width=mcd.width, height=mcd.height,
+                       transform=mcd.transform, crs=mcd.crs, count=1,
+                       dtype="float32", nodata=NODATA, compress="DEFLATE", predictor=3)
+        matching_out = stack.enter_context(rasterio.open(output / "对应类别比例_pct.tif", "w", **profile))
+        diff_out = stack.enter_context(rasterio.open(output / "差异比例_pct.tif", "w", **profile))
+        matching_out.set_band_description(1, "MCD标注类别在GLC中的比例（%）")
+        diff_out.set_band_description(1, "100减对应类别比例（%）")
+        matrix = np.zeros((9,9), dtype=np.float64)
+        fraction_counts = np.zeros((9,9), dtype=np.float64)
+        counts = np.zeros(9, dtype=np.int64)
+        for number, window in enumerate(windows(mcd.width, mcd.height), 1):
+            p, valid, _ = proportions(glc.read(CLASS_BANDS, window=window),
+                                      glc.read_masks(CLASS_BANDS, window=window))
+            labels = mcd.read(1, window=window)
+            valid &= (mcd.read_masks(1, window=window) > 0) & (labels >= 1) & (labels <= 9)
+            r = int(window.row_off)
+            weights = np.broadcast_to(area_by_row[r:r+int(window.height), None], labels.shape).copy()
+            if cover is not None:
+                coverage = cover.read(1, window=window).astype(np.float64)/100
+                coverage_mask = cover.read_masks(1, window=window)>0
+                valid &= coverage_mask & np.isfinite(coverage) & (coverage >= MIN_COVERAGE)
+                weights *= np.clip(coverage, 0, 1)
+            match = np.full(labels.shape, NODATA, dtype=np.float32)
+            diff = np.full(labels.shape, NODATA, dtype=np.float32)
+            for k in range(9):
+                selected = valid & (labels == k+1)
+                counts[k] += int(selected.sum())
+                fraction_counts[k] += p[:, selected].sum(axis=1)
+                matrix[k] += (p[:, selected]*weights[selected][None, :]).sum(axis=1)
+                match[selected] = p[k, selected]*100
+            diff[valid] = 100-match[valid]
+            matching_out.write(match, 1, window=window)
+            diff_out.write(diff, 1, window=window)
+            if number % 10 == 0:
+                print(f"已处理{number}块", flush=True)
+
+        if counts.sum() == 0:
+            raise ValueError(f"没有共同有效格网。输出{output}中的栅格全为NoData，不能作为结果。")
+        mcd_area = matrix.sum(axis=1)
+        glc_area = matrix.sum(axis=0)
+        composition = np.full((9,9), np.nan)
+        np.divide(matrix*100, mcd_area[:,None], out=composition, where=mcd_area[:,None]>0)
+        area_label = "有效覆盖面积" if cover is not None else "整格等效面积"
+        csv_write(output / "MCD类别内GLC平均组成_pct.csv",
+                  ["MCD类别", "格网数"]+[f"GLC_{n}_pct" for n in NAMES]+["对应类别_pct", "差异_pct"],
+                  [[name, counts[k], *composition[k], composition[k,k], 100-composition[k,k]]
+                   for k,name in enumerate(NAMES)])
+        csv_write(output / "类别面积交叉表_km2.csv", [f"MCD行_GLC列_{area_label}"]+NAMES,
+                  [[name,*matrix[k]] for k,name in enumerate(NAMES)])
+        csv_write(output / "类别份额交叉表_等效格网数.csv", ["MCD行_GLC列"]+NAMES,
+                  [[name,*fraction_counts[k]] for k,name in enumerate(NAMES)])
+        csv_write(output / "类别面积对比.csv",
+                  ["类别", f"MCD标签_{area_label}_km2", f"GLC_{area_label}_km2", "GLC减MCD_km2"],
+                  [[name,mcd_area[k],glc_area[k],glc_area[k]-mcd_area[k]] for k,name in enumerate(NAMES)])
+        score = np.trace(matrix)/matrix.sum()*100
+        csv_write(output / "总体指标.csv", ["指标", "数值"], [
+            ["共同有效格网数", counts.sum()], [f"统计{area_label}_km2", matrix.sum()],
+            ["格网平均对应比例_pct", np.trace(fraction_counts)/counts.sum()*100],
+            ["面积加权对应比例_pct", score], ["面积加权差异比例_pct", 100-score],
+            ["九类比例和最大误差_百分点", max_error*100],
+        ])
+        (output / "结果说明.txt").write_text(
+            f"GLC：{GLC_PATH}\nMCD：{MCD_PATH}\n波段对应：{list(zip(CLASS_BANDS,NAMES))}\n"
+            f"输入比例合计：{INPUT_TOTAL}；覆盖率文件：{COVERAGE_PATH}\n"
+            "MCD标注类别为k时，对应比例=GLC第k类比例；差异比例=100%-对应比例。\n"
+            "组成表按像元面积加权；缺少某个MCD类别时，该行比例留空。\n"
+            "MCD标签面积将格网全部归于其标注类别，不代表MCD自身提供的类别面积比例。\n"
+            "无有效面积覆盖率时，面积为整格等效面积：将GLC有效区域组成代表整格。\n"
+            "有覆盖率时，仅使用达到阈值的格网，并按有效覆盖面积对两产品统一加权。\n"
+            "本结果表示产品间类别对应关系，不是分类精度，也不是两份比例数据的直接差值。\n"
+            "如需真正的比例对比例比较，应另行使用MCD自身的类别比例子数据集。\n",
+            encoding="utf-8")
+        print(f"完成：面积加权对应比例{score:.3f}%\n结果目录：{output}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
